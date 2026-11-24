@@ -299,6 +299,33 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_box(batch, box_no, error=str(exc), status=400)
         raise exc
 
+    def handle_posting_failure(batch, box_no: str, exc: Exception):
+        """Last-resort failure handling.
+
+        The store posts version/differences/summary in one transaction, so an
+        unexpected error rolls the attempted posting back.  Re-render the box
+        from committed data instead of a generic error page: the previously
+        posted version, differences and summary stay visible.
+        """
+
+        if isinstance(exc, StaleBoxError):
+            return handle_stale(batch, box_no, exc)
+        response = handle_batch_error(batch, box_no, exc) if isinstance(
+            exc, (BatchLockedError, NotFoundError, CsvError)
+        ) else None
+        if response is not None:
+            return response
+        app.logger.exception("box posting failed for batch=%s box=%s", batch.id, box_no)
+        return render_box(
+            batch,
+            box_no,
+            error=(
+                "本次换交入账失败，所有未完成的写入已回滚；下方仍显示此前已入账的"
+                "版本、差异与汇总。请核对文件后重试。"
+            ),
+            status=500,
+        )
+
     # ------------------------------------------------------------------
     # replacing a box's new-archive content
     # ------------------------------------------------------------------
@@ -326,20 +353,20 @@ def create_app(test_config: dict | None = None) -> Flask:
                 source="box-replacement",
                 expected_versions={box_no: expected_version_id},
             )
-        except StaleBoxError as exc:
-            return handle_stale(batch, box_no, exc)
-        except (BatchLockedError, NotFoundError) as exc:
-            return handle_batch_error(batch, box_no, exc)
+        except Exception as exc:
+            return handle_posting_failure(batch, box_no, exc)
 
         outcome = result[box_no]
         if outcome["created"]:
             flash(
                 f"盒 {box_no} 已换交为第 {outcome['version']} 版"
-                f"（{outcome['item_count']} 条）。该盒原结论已撤下并按新内容重算。",
+                f"（{outcome['item_count']} 条）。新版本、差异与汇总已一起入账："
+                "仅新增、删去或变更的档号重新核对，其余差异行原样保留；"
+                "该盒原确认已撤下。",
                 "success",
             )
         else:
-            flash(f"盒 {box_no} 内容与当前版本一致，未产生新版本。", "info")
+            flash(f"盒 {box_no} 内容与当前版本一致，沿用原版与原确认，未产生新版本。", "info")
         return redirect(url_for("box_detail", batch_id=batch.id, box_no=box_no))
 
     @app.post("/batches/<int:batch_id>/boxes/<path:box_no>/detail")
@@ -381,6 +408,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             return handle_stale(batch, box_no, exc)
         except (BatchLockedError, NotFoundError) as exc:
             return handle_batch_error(batch, box_no, exc)
+        except Exception as exc:
+            return handle_posting_failure(batch, box_no, exc)
 
         flash(
             f"盒 {box_no} 明细已通过清单校验（{result['detail_count']} 条，摘要相符）。",

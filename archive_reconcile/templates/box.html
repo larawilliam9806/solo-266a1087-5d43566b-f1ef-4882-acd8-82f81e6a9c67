@@ -182,8 +182,10 @@
 <section class="card">
   <h2>换交此盒题录</h2>
   <p class="muted">
-    提交此盒完整题录即可换交。该盒内容一变，原差异立即撤下并按新内容重算；其他盒照常可查。
-    若该盒在本页打开后已变更，本次提交会被拒绝。
+    提交此盒完整题录即可换交。入账时只对相较当前版<strong>新增、删去或字段有变</strong>的档号
+    重查旧库明细与原差异：差异消失即撤下，类别变化即转类，其余差异行原样保留；
+    漏录、多录、字段变更小计与汇总同步更新。内容有变时原确认撤下，其他盒照常可查。
+    若该盒在本页打开后已变更，本次提交会被退回。
   </p>
   <form method="post" enctype="multipart/form-data"
         action="{{ url_for('replace_box_items', batch_id=batch.id, box_no=box.box_no) }}" class="grid-form">

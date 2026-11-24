@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .canonical import Item, box_digest, clean_text
-from .reconcile import compare_box, verify_detail_against_manifest
+from .reconcile import classify_pair, compare_box, verify_detail_against_manifest
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -193,6 +193,30 @@ class Detail:
 
 def now() -> float:
     return time.time()
+
+
+def _pair_changed(previous: Item | None, new: Item | None) -> bool:
+    """True when an archive id was added, removed or field-changed."""
+
+    if previous is None or new is None:
+        return True
+    return (
+        previous.title != new.title
+        or previous.retention != new.retention
+    )
+
+
+def _id_chunks(archive_ids: Iterable[str], size: int = 900) -> Iterator[list[str]]:
+    """Yield bounded IN-clause chunks (SQLite variable limit safety)."""
+
+    chunk: list[str] = []
+    for archive_id in archive_ids:
+        chunk.append(archive_id)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
 
 
 class Store:
@@ -363,13 +387,31 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def load_version_items(self, version_id: int, box_no: str = "") -> list[Item]:
+    def load_version_items(
+        self, version_id: int, box_no: str = "", archive_ids: Iterable[str] | None = None
+    ) -> list[Item]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT archive_id, title, retention FROM box_items"
-                " WHERE version_id = ? ORDER BY archive_id COLLATE NOCASE",
-                (version_id,),
-            ).fetchall()
+            if archive_ids is None:
+                rows = conn.execute(
+                    "SELECT archive_id, title, retention FROM box_items"
+                    " WHERE version_id = ? ORDER BY archive_id COLLATE NOCASE",
+                    (version_id,),
+                ).fetchall()
+            else:
+                ids = list(archive_ids)
+                if not ids:
+                    return []
+                rows = []
+                for chunk in _id_chunks(ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(
+                        conn.execute(
+                            "SELECT archive_id, title, retention FROM box_items"
+                            f" WHERE version_id = ? AND archive_id IN ({placeholders})"
+                            " ORDER BY archive_id COLLATE NOCASE",
+                            (version_id, *chunk),
+                        ).fetchall()
+                    )
         return [Item(box_no, r["archive_id"], r["title"], r["retention"]) for r in rows]
 
     def get_detail(self, batch_id: int, box_no: str) -> Detail | None:
@@ -380,13 +422,31 @@ class Store:
             ).fetchone()
         return _detail(row) if row else None
 
-    def load_detail_items(self, detail_id: int, box_no: str = "") -> list[Item]:
+    def load_detail_items(
+        self, detail_id: int, box_no: str = "", archive_ids: Iterable[str] | None = None
+    ) -> list[Item]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT archive_id, title, retention FROM old_detail_items"
-                " WHERE detail_id = ? ORDER BY archive_id COLLATE NOCASE",
-                (detail_id,),
-            ).fetchall()
+            if archive_ids is None:
+                rows = conn.execute(
+                    "SELECT archive_id, title, retention FROM old_detail_items"
+                    " WHERE detail_id = ? ORDER BY archive_id COLLATE NOCASE",
+                    (detail_id,),
+                ).fetchall()
+            else:
+                ids = list(archive_ids)
+                if not ids:
+                    return []
+                rows = []
+                for chunk in _id_chunks(ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(
+                        conn.execute(
+                            "SELECT archive_id, title, retention FROM old_detail_items"
+                            f" WHERE detail_id = ? AND archive_id IN ({placeholders})"
+                            " ORDER BY archive_id COLLATE NOCASE",
+                            (detail_id, *chunk),
+                        ).fetchall()
+                    )
         return [Item(box_no, r["archive_id"], r["title"], r["retention"]) for r in rows]
 
     def get_reconciliation(self, batch_id: int, box_no: str) -> dict | None:
@@ -404,18 +464,39 @@ class Store:
             ).fetchall()
         return {r["box_no"]: _reconciliation(r) for r in rows}
 
-    def get_differences(self, reconciliation_id: int) -> list[dict]:
+    def get_differences(
+        self, reconciliation_id: int, archive_ids: Iterable[str] | None = None
+    ) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM differences WHERE reconciliation_id = ?"
-                " ORDER BY kind, archive_id COLLATE NOCASE",
-                (reconciliation_id,),
-            ).fetchall()
+            if archive_ids is None:
+                rows = conn.execute(
+                    "SELECT * FROM differences WHERE reconciliation_id = ?"
+                    " ORDER BY kind, archive_id COLLATE NOCASE",
+                    (reconciliation_id,),
+                ).fetchall()
+            else:
+                ids = list(archive_ids)
+                if not ids:
+                    return []
+                rows = []
+                for chunk in _id_chunks(ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(
+                        conn.execute(
+                            "SELECT * FROM differences"
+                            f" WHERE reconciliation_id = ? AND archive_id IN ({placeholders})"
+                            " ORDER BY kind, archive_id COLLATE NOCASE",
+                            (reconciliation_id, *chunk),
+                        ).fetchall()
+                    )
         result = []
         for row in rows:
             item = dict(row)
             item["changes"] = json.loads(item.pop("changes_json")) if item["changes_json"] else []
             result.append(item)
+        if archive_ids is not None:
+            # Chunked IN queries cannot preserve one global ordering.
+            result.sort(key=lambda d: (d["kind"], d["archive_id"].casefold()))
         return result
 
     def box_imports(self, batch_id: int) -> list[dict]:
@@ -499,10 +580,20 @@ class Store:
                         stamp,
                     ),
                 )
-                # Content changed: withdraw the old conclusion and, when the
-                # old-side detail is available, immediately recompute it from
-                # the new content.
-                self._recompute(conn, batch_id, box_no)
+                # Content changed: post the new version together with the
+                # incrementally updated differences/summary.  Confirmation is
+                # withdrawn inside the same transaction.
+                self._sync_after_version_change(
+                    conn,
+                    batch_id,
+                    box_no,
+                    previous_version=current,
+                    version_row=conn.execute(
+                        "SELECT * FROM box_versions WHERE id = ?", (version_id,)
+                    ).fetchone(),
+                    new_items=items,
+                    stamp=stamp,
+                )
                 results[box_no] = {
                     "box_no": box_no,
                     "version": version_no,
@@ -631,6 +722,378 @@ class Store:
             " ORDER BY version DESC LIMIT 1",
             (batch_id, box_no),
         ).fetchone()
+
+    def _sync_after_version_change(
+        self,
+        conn: sqlite3.Connection,
+        batch_id: int,
+        box_no: str,
+        *,
+        previous_version: sqlite3.Row | None,
+        version_row: sqlite3.Row,
+        new_items: list[Item],
+        stamp: float,
+    ) -> dict:
+        """Move an existing conclusion to a newly posted box version.
+
+        This is the incremental counterpart of :meth:`_recompute`.  Only
+        archive ids that were added, removed or field-changed relative to the
+        previous version are looked up in ``old_detail_items`` and in
+        ``differences``.  Every other difference row is left untouched, and
+        the missing/extra/changed subtotals are adjusted by per-row deltas
+        instead of scanning the whole difference set.
+
+        Boxes without a fixed manifest or without an accepted old detail have
+        no conclusion to patch, so the ordinary status rows are maintained and
+        a missing conclusion is rebuilt wholesale.
+        """
+
+        manifest_row = conn.execute(
+            "SELECT * FROM manifest WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+        if manifest_row is None:
+            # Box only exists in the new archive: whole box is extra.
+            conn.execute(
+                "DELETE FROM reconciliations WHERE batch_id = ? AND box_no = ?",
+                (batch_id, box_no),
+            )
+            return {"outcome": "extra_box", "summary": {}}
+
+        detail_row = conn.execute(
+            "SELECT * FROM old_details WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+        if detail_row is None:
+            conn.execute(
+                "DELETE FROM reconciliations WHERE batch_id = ? AND box_no = ?",
+                (batch_id, box_no),
+            )
+            return {"outcome": "need_detail", "summary": {}}
+
+        recon_row = conn.execute(
+            "SELECT * FROM reconciliations WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+        if recon_row is None:
+            # No prior conclusion (e.g. detail arrived without one): build it.
+            return self._recompute(conn, batch_id, box_no)
+
+        previous_items = (
+            self._version_items(conn, previous_version["id"], box_no)
+            if previous_version is not None
+            else []
+        )
+        previous_by_id = {item.archive_id: item for item in previous_items}
+        new_by_id = {item.archive_id: item for item in new_items}
+
+        affected_ids = sorted(
+            archive_id
+            for archive_id in previous_by_id.keys() | new_by_id.keys()
+            if _pair_changed(
+                previous_by_id.get(archive_id), new_by_id.get(archive_id)
+            )
+        )
+
+        # Scoped lookups: old-side detail and prior differences are queried
+        # for affected archive ids only.
+        old_detail_by_id = self._target_detail_items(
+            conn, detail_row["id"], affected_ids, box_no
+        )
+        prior_difference_by_id = self._target_difference_rows(
+            conn, recon_row["id"], affected_ids
+        )
+
+        summary = json.loads(recon_row["summary_json"] or "{}")
+        counts = {
+            kind: int(summary.get(kind, 0) or 0)
+            for kind in ("missing", "extra", "changed")
+        }
+        prior_total = sum(counts.values())
+
+        targets: dict[str, dict | None] = {}
+        for archive_id in affected_ids:
+            targets[archive_id] = classify_pair(
+                archive_id,
+                new_by_id.get(archive_id),
+                old_detail_by_id.get(archive_id),
+            )
+
+        if prior_total == 0:
+            # The previous conclusion was a match: there are no untouched
+            # difference rows to preserve, so repost the conclusion row (its
+            # id changes, matching the historical replace behaviour) while
+            # still only writing the affected rows.
+            return self._repost_match_conclusion(
+                conn,
+                batch_id=batch_id,
+                box_no=box_no,
+                old_recon=recon_row,
+                version_row=version_row,
+                detail_row=detail_row,
+                manifest_row=manifest_row,
+                new_by_id=new_by_id,
+                affected_ids=affected_ids,
+                targets=targets,
+                stamp=stamp,
+            )
+
+        # There are difference rows that must survive untouched.  Patch only
+        # the affected rows and move the subtotals by the kind transitions.
+        for archive_id in affected_ids:
+            target = targets[archive_id]
+            prior = prior_difference_by_id.get(archive_id)
+            old_kind = prior["kind"] if prior is not None else None
+            new_kind = target["kind"] if target is not None else None
+            if old_kind is not None:
+                counts[old_kind] -= 1
+            if new_kind is not None:
+                counts[new_kind] += 1
+            if prior is not None and target is None:
+                # Difference disappeared: withdraw the row.
+                conn.execute(
+                    "DELETE FROM differences WHERE id = ?", (prior["id"],)
+                )
+            elif target is not None:
+                if prior is not None:
+                    # Same archive id, possibly another kind (转类); keep the
+                    # row id and refresh every displayed value.
+                    conn.execute(
+                        "UPDATE differences SET kind = ?,"
+                        " new_title = ?, new_retention = ?,"
+                        " old_title = ?, old_retention = ?,"
+                        " changes_json = ? WHERE id = ?",
+                        (
+                            target["kind"],
+                            target["new_title"],
+                            target["new_retention"],
+                            target["old_title"],
+                            target["old_retention"],
+                            json.dumps(target["changes"], ensure_ascii=False),
+                            prior["id"],
+                        ),
+                    )
+                else:
+                    self._insert_difference(conn, recon_row["id"], target)
+
+        total = counts["missing"] + counts["extra"] + counts["changed"]
+        outcome = "differences" if total else "match"
+        self._refresh_summary(
+            summary,
+            box_no=box_no,
+            manifest_row=manifest_row,
+            detail_row=detail_row,
+            new_count=len(new_by_id),
+            counts=counts,
+            total=total,
+        )
+        # Post new version refs + summary together and withdraw confirmation.
+        conn.execute(
+            "UPDATE reconciliations SET version = ?, version_id = ?,"
+            " outcome = ?, summary_json = ?, updated_at = ?,"
+            " finalized_at = NULL WHERE id = ?",
+            (
+                version_row["version"],
+                version_row["id"],
+                outcome,
+                json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                stamp,
+                recon_row["id"],
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM reconciliations WHERE id = ?", (recon_row["id"],)
+        ).fetchone()
+        return _reconciliation(row)
+
+    def _repost_match_conclusion(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        batch_id: int,
+        box_no: str,
+        old_recon: sqlite3.Row,
+        version_row: sqlite3.Row,
+        detail_row: sqlite3.Row,
+        manifest_row: sqlite3.Row,
+        new_by_id: dict[str, Item],
+        affected_ids: list[str],
+        targets: dict[str, dict | None],
+        stamp: float,
+    ) -> dict:
+        """Replace a previously matching conclusion with a fresh row."""
+
+        counts = {"missing": 0, "extra": 0, "changed": 0}
+        difference_rows: list[dict] = []
+        for archive_id in affected_ids:
+            target = targets[archive_id]
+            if target is None:
+                continue
+            counts[target["kind"]] += 1
+            difference_rows.append(target)
+        total = len(difference_rows)
+        outcome = "differences" if total else "match"
+
+        summary = json.loads(old_recon["summary_json"] or "{}")
+        self._refresh_summary(
+            summary,
+            box_no=box_no,
+            manifest_row=manifest_row,
+            detail_row=detail_row,
+            new_count=len(new_by_id),
+            counts=counts,
+            total=total,
+        )
+
+        # No untouched difference rows exist for a zero-subtotal conclusion,
+        # so the cascading delete cannot destroy preserved rows.
+        conn.execute(
+            "DELETE FROM reconciliations WHERE id = ?", (old_recon["id"],)
+        )
+        new_id = self._insert_reconciliation_row(
+            conn,
+            batch_id=batch_id,
+            box_no=box_no,
+            version_row=version_row,
+            detail_row=detail_row,
+            outcome=outcome,
+            summary=summary,
+            stamp=stamp,
+        )
+        for difference in difference_rows:
+            self._insert_difference(conn, new_id, difference)
+        row = conn.execute(
+            "SELECT * FROM reconciliations WHERE id = ?", (new_id,)
+        ).fetchone()
+        return _reconciliation(row)
+
+    @staticmethod
+    def _refresh_summary(
+        summary: dict,
+        *,
+        box_no: str,
+        manifest_row: sqlite3.Row,
+        detail_row: sqlite3.Row,
+        new_count: int,
+        counts: dict[str, int],
+        total: int,
+    ) -> None:
+        summary["box_no"] = box_no
+        summary["manifest_count"] = manifest_row["item_count"]
+        summary["manifest_digest"] = manifest_row["digest"]
+        summary["detail_count"] = detail_row["item_count"]
+        summary["detail_digest"] = detail_row["digest"]
+        summary["old_count"] = detail_row["item_count"]
+        summary["new_count"] = new_count
+        summary["count_matches"] = (
+            detail_row["item_count"] == manifest_row["item_count"]
+        )
+        summary["digest_matches"] = detail_row["digest"] == manifest_row["digest"]
+        summary["missing"] = counts["missing"]
+        summary["extra"] = counts["extra"]
+        summary["changed"] = counts["changed"]
+        summary["differences_total"] = total
+
+    @staticmethod
+    def _target_detail_items(
+        conn: sqlite3.Connection,
+        detail_id: int,
+        archive_ids: Iterable[str],
+        box_no: str,
+    ) -> dict[str, Item]:
+        """Load old-detail rows for the given archive ids only."""
+
+        result: dict[str, Item] = {}
+        for chunk in _id_chunks(archive_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT archive_id, title, retention FROM old_detail_items"
+                f" WHERE detail_id = ? AND archive_id IN ({placeholders})",
+                (detail_id, *chunk),
+            ).fetchall()
+            for row in rows:
+                result[row["archive_id"]] = Item(
+                    box_no, row["archive_id"], row["title"], row["retention"]
+                )
+        return result
+
+    @staticmethod
+    def _target_difference_rows(
+        conn: sqlite3.Connection,
+        reconciliation_id: int,
+        archive_ids: Iterable[str],
+    ) -> dict[str, sqlite3.Row]:
+        """Load prior difference rows for the given archive ids only."""
+
+        result: dict[str, sqlite3.Row] = {}
+        for chunk in _id_chunks(archive_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT * FROM differences"
+                f" WHERE reconciliation_id = ? AND archive_id IN ({placeholders})"
+                " ORDER BY id",
+                (reconciliation_id, *chunk),
+            ).fetchall()
+            for row in rows:
+                # Application invariants give at most one row per archive id;
+                # keep the earliest if a legacy duplicate exists.
+                result.setdefault(row["archive_id"], row)
+        return result
+
+    @staticmethod
+    def _insert_difference(
+        conn: sqlite3.Connection, reconciliation_id: int, difference: dict
+    ) -> None:
+        conn.execute(
+            "INSERT INTO differences"
+            " (reconciliation_id, archive_id, kind, new_title, new_retention,"
+            "  old_title, old_retention, changes_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reconciliation_id,
+                difference["archive_id"],
+                difference["kind"],
+                difference["new_title"],
+                difference["new_retention"],
+                difference["old_title"],
+                difference["old_retention"],
+                json.dumps(difference["changes"], ensure_ascii=False),
+            ),
+        )
+
+    @staticmethod
+    def _insert_reconciliation_row(
+        conn: sqlite3.Connection,
+        *,
+        batch_id: int,
+        box_no: str,
+        version_row: sqlite3.Row | None,
+        detail_row: sqlite3.Row,
+        outcome: str,
+        summary: dict,
+        stamp: float,
+    ) -> int:
+        cursor = conn.execute(
+            "INSERT INTO reconciliations"
+            " (batch_id, box_no, version, version_id, detail_id, detail_count,"
+            "  detail_digest, outcome, summary_json, created_at, updated_at,"
+            "  finalized_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                batch_id,
+                box_no,
+                None if version_row is None else version_row["version"],
+                None if version_row is None else version_row["id"],
+                detail_row["id"],
+                detail_row["item_count"],
+                detail_row["digest"],
+                outcome,
+                json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                stamp,
+                stamp,
+            ),
+        )
+        return cursor.lastrowid
 
     def _recompute(
         self, conn: sqlite3.Connection, batch_id: int, box_no: str

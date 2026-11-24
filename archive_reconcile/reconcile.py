@@ -29,6 +29,54 @@ class BoxComparison:
     differences: list[dict] = field(default_factory=list)
 
 
+def classify_pair(archive_id: str, new: Item | None, old: Item | None) -> dict | None:
+    """Classify one archive id from its new/old records.
+
+    Returns a difference row dict (same shape as :func:`compare_box` rows) or
+    ``None`` when the pair has no difference.  Either side may be ``None``,
+    meaning the archive id is absent from that side.
+    """
+
+    if new is None and old is None:
+        return None
+    if new is None:
+        return {
+            "archive_id": archive_id,
+            "kind": "missing",
+            "new_title": None,
+            "new_retention": None,
+            "old_title": old.title,
+            "old_retention": old.retention,
+            "changes": ["title", "retention"],
+        }
+    if old is None:
+        return {
+            "archive_id": archive_id,
+            "kind": "extra",
+            "new_title": new.title,
+            "new_retention": new.retention,
+            "old_title": None,
+            "old_retention": None,
+            "changes": ["title", "retention"],
+        }
+    changed_fields = []
+    if new.title != old.title:
+        changed_fields.append("title")
+    if new.retention != old.retention:
+        changed_fields.append("retention")
+    if not changed_fields:
+        return None
+    return {
+        "archive_id": archive_id,
+        "kind": "changed",
+        "new_title": new.title,
+        "new_retention": new.retention,
+        "old_title": old.title,
+        "old_retention": old.retention,
+        "changes": changed_fields,
+    }
+
+
 def verify_detail_against_manifest(
     box_no: str,
     detail_items: Iterable[Item],
@@ -90,51 +138,15 @@ def compare_box(
 
     differences: list[dict] = []
     for archive_id in sorted(old_by_id.keys() - new_by_id.keys()):
-        old = old_by_id[archive_id]
-        differences.append(
-            {
-                "archive_id": archive_id,
-                "kind": "missing",
-                "new_title": None,
-                "new_retention": None,
-                "old_title": old.title,
-                "old_retention": old.retention,
-                "changes": ["title", "retention"],
-            }
-        )
+        differences.append(classify_pair(archive_id, None, old_by_id[archive_id]))
     for archive_id in sorted(new_by_id.keys() - old_by_id.keys()):
-        new = new_by_id[archive_id]
-        differences.append(
-            {
-                "archive_id": archive_id,
-                "kind": "extra",
-                "new_title": new.title,
-                "new_retention": new.retention,
-                "old_title": None,
-                "old_retention": None,
-                "changes": ["title", "retention"],
-            }
-        )
+        differences.append(classify_pair(archive_id, new_by_id[archive_id], None))
     for archive_id in sorted(new_by_id.keys() & old_by_id.keys()):
-        new = new_by_id[archive_id]
-        old = old_by_id[archive_id]
-        changed_fields = []
-        if new.title != old.title:
-            changed_fields.append("title")
-        if new.retention != old.retention:
-            changed_fields.append("retention")
-        if changed_fields:
-            differences.append(
-                {
-                    "archive_id": archive_id,
-                    "kind": "changed",
-                    "new_title": new.title,
-                    "new_retention": new.retention,
-                    "old_title": old.title,
-                    "old_retention": old.retention,
-                    "changes": changed_fields,
-                }
-            )
+        difference = classify_pair(
+            archive_id, new_by_id[archive_id], old_by_id[archive_id]
+        )
+        if difference is not None:
+            differences.append(difference)
 
     manifest_count = manifest_entry["item_count"] if manifest_entry else None
     manifest_digest = manifest_entry["digest"] if manifest_entry else None
